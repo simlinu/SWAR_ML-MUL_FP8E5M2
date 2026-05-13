@@ -6,6 +6,35 @@
 // ---------------------------------------------------------
 uint64_t swar_fp8_mul(uint64_t a, uint64_t b) {
 
+    // 0. NaN Detection
+    // We want to detect whether one of the two inputs is NaN to set the result to NaN 
+    // in that case. In E5M2 NaN is represented by 0x80 (b10000000, the sign bit is 1 
+    // and the rest is 0). So we can detect whether a lane is NaN by checking whether 
+    // the sign bit is 1 and the rest of the bits are 0. 
+    // We can achieve this by subtracting from the value its 8th bit shifted seven times
+    // to the right so that the result lane will have 0 in the eighth bit if it was NaN
+    // or if it had the 8th bit set to 0. 
+    // To exclude the case in which the 8th bit was set to 0 we and the negation of the 
+    // result with the original value so that we will have 0 in eigth bit  if it was not 
+    // NaN and 1 if it was NaN. Then we mask the other bits to 0.
+    uint64_t a_bit = a - ((a & 0x8080808080808080ULL) >> 7);
+    uint64_t a_nan = (a & ~a_bit) & 0x8080808080808080ULL; 
+    uint64_t b_bit = b - ((b & 0x8080808080808080ULL) >> 7);
+    uint64_t b_nan = (b & ~b_bit) & 0x8080808080808080ULL;
+    uint64_t nan_bit = a_nan | b_nan; 
+    
+    // 0.5 NaN Masks
+    // We have to use two masks, the first sets everything to 0 and the other sets the 
+    // sign bit to 1. 
+    // 0xFF if nan and 0x00 otherwise, we will AND it with the final result at the end 
+    // to set to NaN the lanes where there was a NaN in input
+    uint64_t nan_mask1 = ~(nan_bit - (nan_bit >> 7)); 
+
+    // 0x80 if nan and 0x00 otherwise, we will OR it with the final result at the end to 
+    // set to NaN the lanes where there was a NaN in input
+    uint64_t nan_mask2 = nan_bit;
+
+
     // 1. Extract Signs
     // XOR the sign bits together to get the final signs and mask the non sign bits. So 
     // we have for each fp8 lane 0x00 (b00000000) if both inputs had the same sign and 
@@ -31,8 +60,8 @@ uint64_t swar_fp8_mul(uint64_t a, uint64_t b) {
     uint64_t half_add = (0x8080808080808080ULL | sum) - 0x3C3C3C3C3C3C3C3CULL;
 
     // 4. Overflow detection
-    // If the result is greater or equal to 0x7C (b01111100) then it has overflown. We 
-    // add to half_add 0x04 (b00000100) so that it carries over to the eigth bit
+    // If the result is greater or equal to 0x7F (b01111111) then it has overflown. We 
+    // add to half_add 0x01 (b00000001) so that it carries over to the eigth bit
     // If 8th bit is 1 both in sum and half_add', it means there is overflow and we store 
     // it in a mask with 0x80 (b10000000) in the lanes where there was an overflow and 
     // 0x00 (b00000000) where there was not.
@@ -41,31 +70,21 @@ uint64_t swar_fp8_mul(uint64_t a, uint64_t b) {
     // example, if sum is equal 0x40 (b01000000) and we subtract 0x3C (b00111100) we get 
     // 0x04 (b00000100) without overflow. However, half_add would have the 8th bit set 
     // to 1 because we set it to 1 before the subtraction.
-    uint64_t overflow_bit = sum & (half_add + 0x0404040404040404ULL) & 0x8080808080808080ULL;
+    uint64_t overflow_bit = sum & (half_add + 0x0101010101010101ULL) & 0x8080808080808080ULL;
 
     // 5. Overflow mask
-    // When we have an overflow the result should be saturated to 0x7C (b01111100, the 
+    // When we have an overflow the result should be saturated to 0x7F (b01111111, the 
     // max valid E5M2 value). 
-    // We can achieve this by creating two masks: the first one has 0x7F (b01111111) in 
-    // the lanes where there was an overflow and 0x00 (b00000000) otherwise, the second 
-    // one has 0x7C (b01111100) in the lanes where there was an overflow and 0x7F 
-    // (b01111111) otherwise. We then OR the result with the first mask (setting all 
-    // bits to 1 if there was an overflow and leaving it unchanged otherwise) and AND it 
-    // with the second mask (setting the last two bits to 0 if there was an overflow and 
-    // leaving it unchanged otherwise)
-    // The first mask is created by smearing the 8th bit: we subtract the value with its 
-    // right-shifted-by-7 version so that if there was an overflow we get 0x7F (b01111111) 
-    // and if there was not we get 0x00 (b00000000)
-    // The second mask is created by right-shifting the overflow bit by subtracting from
-    // 0xFF (b11111111) the value obtained by right-shifting the overflow bit by 6 and 
-    // by 7 so that if there was an overflow we get 0x7C (b01111100) and if there was 
-    // not we get 0x7F (b01111111)
+    // We can achieve this by creating a mask with 0x7F (b01111111) in the lanes where 
+    // there was an overflow and 0x00 (b00000000) otherwise
+    // The  mask is created by smearing the 8th bit: we subtract the value with its 
+    // right-shifted-by-7 version so that if there was an overflow we get 0x7F 
+    // (b01111111) and if there was not we get 0x00 (b00000000)
     uint64_t overflow_mask = overflow_bit - (overflow_bit >> 7);
-    uint64_t overflow_mask2 = 0xFFFFFFFFFFFFFFFFULL - ((overflow_bit >> 6) + (overflow_bit >> 7));
 
     // 6. Underflow detection
-    // We have underflow if result is smaller than 0x04 (b00000100). So we subtract from
-    // half_add 0x04 (b00000100) so that we are sure that it will set to 0 the eight bit
+    // We have underflow if result is smaller than 0x01 (b00000001). So we subtract from
+    // half_add 0x01 (b00000001) so that we are sure that it will set to 0 the eight bit
     // If 8th bit is 0 both in sum and half_add', it means there is underflow and we 
     // store it in a mask with 0x80 (b10000000) in the lanes where there was an 
     // underflow and 0x00 (b00000000) where there was not.
@@ -74,7 +93,7 @@ uint64_t swar_fp8_mul(uint64_t a, uint64_t b) {
     // if sum is equal 0x80 (b10000000) and we subtract 0x3C (b00111100) we get 0x40
     // (b01000100) without underflow. However, half_add would have the 8th bit set 
     // to 0
-    uint64_t underflow_bit = ~sum & ~(half_add - 0x0404040404040404ULL) & 0x8080808080808080ULL;
+    uint64_t underflow_bit = ~sum & ~(half_add - 0x0101010101010101ULL) & 0x8080808080808080ULL;
 
     // 6.1 Zero Operand Detection 
     // When one operand is zero the multiplication has to return zero
@@ -91,24 +110,28 @@ uint64_t swar_fp8_mul(uint64_t a, uint64_t b) {
     // 7. Underflow mask
     // When we have an underflow the result should be flushed to zero. We can achieve
     // this by creating a mask with 0x00 (b00000000) in the lanes where there was an 
-    // underflow and 0x7F (b01111111) where there was not and ANDing the result with it 
+    // underflow and 0xFF (b11111111) where there was not and ANDing the result with it 
     // (setting all bits to 0 if there was an underflow and leaving it unchanged 
     // otherwise).
-    // We create the mask by smearing the 8th bit: we subtract the value with its 
-    // right-shifted-by-7 version so that if there was an underflow we get 0x00 
-    // (b00000000) and if there was not we get 0x7F (b01111111)
-    uint64_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7));
+    // We create the mask by smearing the 8th bit and readding it: we subtract the 
+    // value with its right-shifted-by-7 version so that if there was an underflow we 
+    // get 0x00 (b00000000) and if there was not we get 0xFF (b11111111)
+    uint64_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7) + underflow_bit);
 
     // 8. Final result 
     // Now we have all the components to compute the final result:
-    // We apply the overflow and underflow masks to the half_add so that if there was an 
-    // overflow we set the result to 0x7C (b01111100, the max valid E5M2 value) if there
-    // was an underflow we flush to 0x00 (b00000000) and if none of the two occurred we
-    // keep the result unchanged. 
-    // Finally, we combine the signs with the 7-bit result (we have to mask the signs to 
+    // We apply the overflow mask to the half_add so that if there was an overflow we 
+    // set the result to 0x7C (b01111111, the max valid E5M2 value),
+    // Then we combine the signs with the 7-bit result (we have to mask the signs to 
     // avoid interferences) by ORing them together 
-    uint64_t res_7bit = (half_add | overflow_mask) & underflow_mask & overflow_mask2;
-    uint64_t res = signs | (res_7bit & 0x7F7F7F7F7F7F7F7FULL);
+    // Then we apply the underflow mask so that if there was an underflow we set the
+    // result to 0x00 (b00000000) 
+    // And finally we apply the NaN Mask setting the result to 0x80 (b10000000) if the 
+    // result is NaN (overflow with negative sign) and leaving it
+    uint64_t res_7bit = (half_add | overflow_mask);
+    uint64_t res_bef_uf_nan = signs | (res_7bit & 0x7F7F7F7F7F7F7F7FULL);
+    uint64_t res_bef_nan = res_bef_uf_nan & underflow_mask;
+    uint64_t res = (res_bef_nan & nan_mask1) | nan_mask2;
 
     return res;
 
@@ -122,19 +145,31 @@ uint32_t swar_fp8_mul(uint32_t a, uint32_t b) {
     // For the documentation of the algorithm please refer to the 8 at a time version, 
     // the only difference is that here we have 4 lanes instead of 8 
     
+    uint32_t a_bit = a - ((a & 0x80808080) >> 7);
+    uint32_t a_nan = (a & ~a_bit) & 0x80808080; 
+    uint32_t b_bit = b - ((b & 0x80808080) >> 7);
+    uint32_t b_nan = (b & ~b_bit) & 0x80808080;
+    uint32_t nan_bit = a_nan | b_nan; 
+    
+    uint32_t nan_mask1 = ~(nan_bit - (nan_bit >> 7)); 
+    uint32_t nan_mask2 = nan_bit;
+
     uint32_t signs = (a ^ b) & 0x80808080;
     uint32_t sum = (a & 0x7F7F7F7F) + (b & 0x7F7F7F7F);
     uint32_t half_add = (0x80808080 | sum) - 0x3C3C3C3C; 
-    uint32_t overflow_bit = sum & (half_add + 0x04040404) & 0x80808080; 
-    uint32_t underflow_bit = ~sum & ~(half_add - 0x04040404) & 0x80808080;
+    uint32_t overflow_bit = sum & (half_add + 0x01010101) & 0x80808080; 
+    uint32_t overflow_mask = overflow_bit - (overflow_bit >> 7);
+    uint32_t underflow_bit = ~sum & ~(half_add - 0x01010101) & 0x80808080;
     uint32_t a_zero = ((~a & 0x7F7F7F7F) + 0x01010101) & 0x80808080;
     uint32_t b_zero = ((~b & 0x7F7F7F7F) + 0x01010101) & 0x80808080;
     underflow_bit = underflow_bit | a_zero | b_zero;
-    uint32_t overflow_mask = overflow_bit - (overflow_bit >> 7);
-    uint32_t overflow_mask2 = 0xFFFFFFFF - ((overflow_bit >> 6) + (overflow_bit >> 7));
-    uint32_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7)); 
-    uint32_t res_7bit = (half_add | overflow_mask) & underflow_mask & overflow_mask2; 
-    uint32_t res = signs | (res_7bit & 0x7F7F7F7F); 
+    uint32_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7) + underflow_bit); 
+    
+    uint32_t res_7bit = (half_add | overflow_mask);
+    uint32_t res_bef_uf_nan = signs | (res_7bit & 0x7F7F7F7F);
+    uint32_t res_bef_nan = res_bef_uf_nan & underflow_mask;
+    uint32_t res = (res_bef_nan & nan_mask1) | nan_mask2;
+
     return res;
 }
 
@@ -146,19 +181,32 @@ uint8_t scalar_fp8_mul(uint8_t a, uint8_t b) {
     // The algorithm is the same as the one used in the SWAR versions, but here we only 
     // have 1 lane so refer to that for the documentation of the steps. 
 
-    uint8_t sign = (a ^ b) & 0x80;
+    uint8_t a_bit = a - ((a & 0x80) >> 7);
+    uint8_t a_nan = (a & ~a_bit) & 0x80; 
+    uint8_t b_bit = b - ((b & 0x80) >> 7);
+    uint8_t b_nan = (b & ~b_bit) & 0x80;
+    uint8_t nan_bit = a_nan | b_nan; 
+    
+    uint8_t nan_mask1 = ~(nan_bit - (nan_bit >> 7)); 
+    uint8_t nan_mask2 = nan_bit;
+
+    uint8_t signs = (a ^ b) & 0x80;
     uint8_t sum = (a & 0x7F) + (b & 0x7F);
     uint8_t half_add = (0x80 | sum) - 0x3C; // 0x3C is the bias for E5M2
-    uint8_t overflow_bit = sum & (half_add + 0x04) & 0x80;
-    uint8_t underflow_bit = ~sum & ~(half_add - 0x04) & 0x80;
+    uint8_t overflow_bit = sum & (half_add + 0x01) & 0x80;
+    uint8_t overflow_mask = overflow_bit - (overflow_bit >> 7);
+    uint8_t underflow_bit = ~sum & ~(half_add - 0x01) & 0x80;
     uint8_t a_zero = ((~a & 0x7F) + 0x01) & 0x80;
     uint8_t b_zero = ((~b & 0x7F) + 0x01) & 0x80;
     underflow_bit = underflow_bit | a_zero | b_zero;
-    uint8_t overflow_mask = overflow_bit - (overflow_bit >> 7);
-    uint8_t overflow_mask2 = 0xFF - ((overflow_bit >> 6) + (overflow_bit >> 7));
-    uint8_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7));
-    uint8_t res_7bit = (half_add | overflow_mask) & underflow_mask & overflow_mask2;
-    return sign | (res_7bit & 0x7F);
+    uint8_t underflow_mask = ~(underflow_bit - (underflow_bit >> 7) + underflow_bit);
+
+    uint8_t res_7bit = (half_add | overflow_mask);
+    uint8_t res_bef_uf_nan = signs | (res_7bit & 0x7F);
+    uint8_t res_bef_nan = res_bef_uf_nan & underflow_mask;
+    uint8_t res = (res_bef_nan & nan_mask1) | nan_mask2;
+
+    return res;
 
 }
 

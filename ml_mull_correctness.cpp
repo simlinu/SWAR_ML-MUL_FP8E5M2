@@ -6,10 +6,13 @@
 
 uint8_t fp8_mul(uint8_t a, uint8_t b, bool trunc) {
 
+    // Handle special NaN case where 0x80 is treated as NaN, propagating as 0x80
+    if (a == 0x80 || b == 0x80) return 0x80;
+
     // 1. Zero check: if either operand has a zero magnitude, return zero with the 
     // correct sign
-    if ((a & 0x7F) == 0 || (b & 0x7F) == 0)
-        return (a ^ b) & 0x80;
+    if (a == 0x00 || b == 0x00)
+        return 0x00;
 
     // 2. Extract mantissas and add the implicit leading 1 
     // For E5M2, the mantissa is 2 bits, so the implicit 1 is mapped to position 4 (0x04)
@@ -48,12 +51,18 @@ uint8_t fp8_mul(uint8_t a, uint8_t b, bool trunc) {
     uint8_t s = (a ^ b) & 0x80;
 
     // 8. Handle Exponent Bounds (Underflow / Overflow)
-    if (e_res <= 0) {
-        return s; // Flush to zero on underflow
+    if (e_res < 0) {
+        return 0x00; // Flush to zero on underflow
     } 
-    else if (e_res >= 31) {
-        return s | 0x7C; // Cap at Infinity (0x7C) on overflow
+    else if (e_res > 31) {
+        // The SWAR implementation saturates to NaN (0x7F) on overflow
+        return s | 0x7F;
     }
+    else if (e_res == 0 && m_res == 0) {
+        // Handle the case where the result is exactly zero after rounding
+        return 0x00;
+    }
+    
 
     // 9. Pack and return final FP8 value
     return s | (e_res << 2) | m_res;
